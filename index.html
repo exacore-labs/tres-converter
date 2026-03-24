@@ -248,6 +248,29 @@ async function convert({headers,rows},walletName){
   }
   pw.style.display='none';
 
+  // Fetch historical BTC/USD prices from CryptoCompare (one bulk call)
+  const txDates=new Set(rows.map(r=>(r.time||'').trim().slice(0,10)).filter(Boolean));
+  let priceCache={};
+  try{priceCache=JSON.parse(localStorage.getItem('tres_price_cache')||'{}');}catch(e){}
+  const missingDates=[...txDates].filter(d=>!priceCache[d]);
+  if(missingDates.length){
+    log('Fetching historical BTC/USD prices...');
+    try{
+      const resp=await fetch('https://min-api.cryptocompare.com/data/v2/histoday?fsym=BTC&tsym=USD&limit=2000');
+      const d=await resp.json();
+      for(const p of(d.Data?.Data||[])){
+        const dt=new Date(p.time*1000);
+        const ds=dt.getUTCFullYear()+'-'+pad2(dt.getUTCMonth()+1)+'-'+pad2(dt.getUTCDate());
+        priceCache[ds]=p.close;
+      }
+      try{localStorage.setItem('tres_price_cache',JSON.stringify(priceCache));}catch(e){}
+      const still=[...txDates].filter(d=>!priceCache[d]);
+      log(Object.keys(priceCache).length+' daily prices cached, '+still.length+' missing');
+    }catch(e){log('Price fetch failed: '+e.message+' (using export values as fallback)');}
+  }else{
+    log('Price cache hit for all '+txDates.size+' dates');
+  }
+
   // Build known addresses from outgoing tx inputs
   const knownAddresses=new Set();
   for(const rec of rows){
@@ -284,9 +307,17 @@ async function convert({headers,rows},walletName){
     const asset=(rec.unit||'BTC').trim().toUpperCase();
     const feeRaw=(rec['fee (BTC)']||'').trim();
     const fee=feeRaw?Math.abs(parseFloat(feeRaw)):0;
-    const fiatRaw=fiatCol?(rec[fiatCol]||'').trim():'';
-    const fiatVal=fiatRaw?Math.abs(parseFloat(fiatRaw)):'';
-
+    // Use historical price for fiat value (fall back to export value)
+    const txDate=ts.slice(0,10);
+    let fiatVal='',btcPrice=0;
+    if(priceCache[txDate]){
+      btcPrice=priceCache[txDate];
+      fiatVal=Math.round(amount*btcPrice*100)/100;
+    }else{
+      const fiatRaw=fiatCol?(rec[fiatCol]||'').trim():'';
+      fiatVal=fiatRaw?Math.abs(parseFloat(fiatRaw)):'';
+      btcPrice=(fiatVal&&amount>0)?fiatVal/amount:0;
+    }
     const direction=desc==='incoming'?'receiver':'sender';
     const txData=cache[txhash]||{vin:[],vout:[]};
     const[,counterparty]=resolveAddresses(txData,desc,parseFloat(rec.amount||'0'),knownAddresses);
@@ -314,7 +345,7 @@ async function convert({headers,rows},walletName){
     if(fee>0){
       counter[txhash]++;
       let feeFiat='';
-      if(fiatVal&&amount>0)feeFiat=Math.round(fee*(fiatVal/amount)*100)/100;
+      if(btcPrice>0)feeFiat=Math.round(fee*btcPrice*100)/100;
       out.push([
         dt.getUTCFullYear(),dt.getUTCMonth()+1,dt.getUTCDate(),
         pad2(dt.getUTCHours())+':'+pad2(dt.getUTCMinutes())+':'+pad2(dt.getUTCSeconds()),

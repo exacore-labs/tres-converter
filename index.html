@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tres Finance CSV Converter</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0f1117;--card:#1a1d27;--border:#2a2d3a;--text:#e1e4ed;--dim:#6b7084;--accent:#4f8cff;--accent2:#3b6fd4;--green:#34d399;--red:#f87171;--orange:#fbbf24}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:2rem 1rem}
+h1{font-size:1.6rem;font-weight:600;margin-bottom:.25rem}
+.subtitle{color:var(--dim);font-size:.85rem;margin-bottom:2rem}
+.container{width:100%;max-width:640px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1.5rem;margin-bottom:1rem}
+label{display:block;font-size:.8rem;color:var(--dim);margin-bottom:.4rem;font-weight:500;text-transform:uppercase;letter-spacing:.05em}
+input[type=text],select{width:100%;padding:.6rem .8rem;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:.9rem;outline:none}
+input:focus,select:focus{border-color:var(--accent)}
+select option:disabled{color:var(--dim)}
+.row{display:flex;gap:1rem}.row>*{flex:1}
+.dropzone{border:2px dashed var(--border);border-radius:12px;padding:2.5rem 1rem;text-align:center;cursor:pointer;transition:all .2s}
+.dropzone:hover,.dropzone.dragover{border-color:var(--accent);background:rgba(79,140,255,.05)}
+.dropzone.has-file{border-color:var(--green);border-style:solid}
+.dropzone p{color:var(--dim);font-size:.9rem}.dropzone .icon{font-size:2rem;margin-bottom:.5rem}
+.dropzone .filename{color:var(--green);font-weight:500;font-size:.95rem}
+.progress-wrap{margin-top:1rem;display:none}
+.progress-bar{height:6px;background:var(--border);border-radius:3px;overflow:hidden}
+.progress-fill{height:100%;background:var(--accent);width:0%;transition:width .3s}
+.progress-text{font-size:.75rem;color:var(--dim);margin-top:.3rem;text-align:right}
+.btn{display:inline-flex;align-items:center;gap:.5rem;padding:.7rem 1.5rem;border:none;border-radius:8px;font-size:.9rem;font-weight:500;cursor:pointer;transition:all .15s}
+.btn-primary{background:var(--accent);color:#fff}.btn-primary:hover{background:var(--accent2)}
+.btn-primary:disabled{opacity:.4;cursor:not-allowed}
+.stats{display:none}.stats .grid{display:grid;grid-template-columns:1fr 1fr;gap:.75rem}
+.stat{background:var(--bg);border-radius:8px;padding:.75rem 1rem}
+.stat .val{font-size:1.2rem;font-weight:600}.stat .lbl{font-size:.7rem;color:var(--dim);text-transform:uppercase;margin-top:.15rem}
+.error{color:var(--red);font-size:.85rem;margin-top:.5rem;display:none}
+footer{margin-top:2rem;color:var(--dim);font-size:.75rem}
+</style>
+</head>
+<body>
+<h1>Tres Finance CSV Converter</h1>
+<p class="subtitle">Convert wallet exports to Tres Finance bulk upload format · 100% client-side</p>
+<div class="container">
+  <div class="card">
+    <div class="row" style="margin-bottom:1rem">
+      <div><label>Wallet Name</label><input type="text" id="walletName" placeholder="e.g. exacore-main" value="exacore-main"></div>
+      <div><label>Source Format</label><select id="sourceFormat"><option value="green">Blockstream Green</option><option disabled>Kraken (coming soon)</option></select></div>
+    </div>
+    <div class="dropzone" id="dropzone">
+      <div class="icon">📄</div>
+      <p>Drop CSV here or click to browse</p>
+    </div>
+    <input type="file" id="fileInput" accept=".csv" hidden>
+    <div class="progress-wrap" id="progressWrap">
+      <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+      <div class="progress-text" id="progressText">0 / 0</div>
+    </div>
+    <div class="error" id="errorMsg"></div>
+  </div>
+  <div style="text-align:center">
+    <button class="btn btn-primary" id="convertBtn" disabled>Convert &amp; Download</button>
+  </div>
+  <div class="card stats" id="statsCard">
+    <label style="margin-bottom:.75rem">Conversion Results</label>
+    <div class="grid">
+      <div class="stat"><div class="val" id="sInputRows">-</div><div class="lbl">Input Rows</div></div>
+      <div class="stat"><div class="val" id="sOutputRows">-</div><div class="lbl">Output Rows</div></div>
+      <div class="stat"><div class="val" id="sTransactions">-</div><div class="lbl">Transactions</div></div>
+      <div class="stat"><div class="val" id="sFeeRows">-</div><div class="lbl">Fee Rows</div></div>
+      <div class="stat"><div class="val" id="sDateRange">-</div><div class="lbl">Date Range</div></div>
+      <div class="stat"><div class="val" id="sApiCalls">-</div><div class="lbl">API Lookups</div></div>
+    </div>
+  </div>
+</div>
+<footer>Data never leaves your browser · Powered by mempool.space API</footer>
+
+<script>
+const HEADERS=["Year","Month","Day","Time","Organizational Wallet","Participating Wallet","Network","Direction","Financial Action","Asset Identifier","Amount","Fiat Value (optional)","Fiat Currency","Transaction Hash","Transfer ID","Function Name","Method ID","Note","Activity Name"];
+const API_BASE="https://mempool.space/api/tx";
+
+// Cache in localStorage
+function getCache(){try{return JSON.parse(localStorage.getItem('tres_tx_cache')||'{}');}catch(e){return {};}}
+function setCache(c){try{localStorage.setItem('tres_tx_cache',JSON.stringify(c));}catch(e){}}
+
+// Rate-limited fetch with retry
+async function fetchTx(hash,cache,signal){
+  if(cache[hash])return cache[hash];
+  const resp=await fetch(`${API_BASE}/${hash}`,{headers:{'User-Agent':'tres-converter/1.0'},signal});
+  if(resp.status===429){await new Promise(r=>setTimeout(r,10000));return fetchTx(hash,cache,signal);}
+  if(!resp.ok){cache[hash]={vin:[],vout:[],error:resp.status};return cache[hash];}
+  const data=await resp.json();
+  const result={
+    vin:data.vin?.filter(v=>v.prevout?.scriptpubkey_address).map(v=>({address:v.prevout.scriptpubkey_address,value:v.prevout.value}))||[],
+    vout:data.vout?.filter(v=>v.scriptpubkey_address).map(v=>({address:v.scriptpubkey_address,value:v.value}))||[]
+  };
+  cache[hash]=result;
+  return result;
+}
+
+function parseCSV(text){
+  const lines=text.split(/\r?\n/).filter(l=>l.trim());
+  if(lines.length<2)throw new Error('CSV has no data rows');
+  // Parse header
+  const hdr=lines[0].split(',').map(h=>h.trim().replace(/^"|"$/g,''));
+  const rows=[];
+  for(let i=1;i<lines.length;i++){
+    const vals=[];let cur='',inQ=false;
+    for(const ch of lines[i]){
+      if(ch==='"'){inQ=!inQ;}else if(ch===','&&!inQ){vals.push(cur.trim());cur='';}else{cur+=ch;}
+    }
+    vals.push(cur.trim());
+    if(vals.length>=hdr.length){const obj={};hdr.forEach((h,j)=>obj[h]=vals[j]||'');rows.push(obj);}
+  }
+  return {headers:hdr,rows};
+}
+
+function resolveAddresses(txData,direction,csvAmountBtc,knownAddresses){
+  const vin=txData.vin||[],vout=txData.vout||[];
+  if(!vin.length&&!vout.length)return['unknown','unknown'];
+  const csvSats=Math.round(Math.abs(csvAmountBtc)*1e8);
+  if(direction==='outgoing'){
+    const org=vin.length?vin[0].address:'unknown';
+    let cp='unknown',bestDiff=Infinity;
+    for(const v of vout){const d=Math.abs(v.value-csvSats);if(d<bestDiff){bestDiff=d;cp=v.address;}}
+    if(bestDiff>10000&&vout.length===2){
+      const inAddrs=new Set(vin.map(v=>v.address));
+      for(const v of vout){if(!inAddrs.has(v.address)&&!knownAddresses.has(v.address)){cp=v.address;break;}}
+    }
+    return[org,cp];
+  }else if(direction==='incoming'){
+    const cp=vin.length?vin[0].address:'unknown';
+    let org='unknown';
+    for(const v of vout){if(knownAddresses.has(v.address)){org=v.address;break;}}
+    if(org==='unknown'){for(const v of vout){if(v.value===csvSats){org=v.address;break;}}}
+    if(org==='unknown'&&vout.length<=5){let bd=Infinity;for(const v of vout){const d=Math.abs(v.value-csvSats);if(d<bd){bd=d;org=v.address;}}}
+    return[org,cp];
+  }else{
+    return[vin.length?vin[0].address:'unknown',vout.length?vout[0].address:'unknown'];
+  }
+}
+
+// State
+let csvData=null,abortCtrl=null;
+const $=id=>document.getElementById(id);
+const dz=$('dropzone'),fi=$('fileInput'),btn=$('convertBtn');
+
+dz.addEventListener('click',()=>fi.click());
+dz.addEventListener('dragover',e=>{e.preventDefault();dz.classList.add('dragover');});
+dz.addEventListener('dragleave',()=>dz.classList.remove('dragover'));
+dz.addEventListener('drop',e=>{e.preventDefault();dz.classList.remove('dragover');handleFile(e.dataTransfer.files[0]);});
+fi.addEventListener('change',()=>{if(fi.files[0])handleFile(fi.files[0]);});
+
+function handleFile(file){
+  if(!file||!file.name.endsWith('.csv')){showError('Please select a CSV file');return;}
+  const reader=new FileReader();
+  reader.onload=e=>{
+    try{
+      csvData=parseCSV(e.target.result);
+      dz.classList.add('has-file');
+      dz.innerHTML=`<div class="icon">✅</div><div class="filename">${file.name}</div><p>${csvData.rows.length} rows loaded</p>`;
+      btn.disabled=false;hideError();
+    }catch(err){showError(err.message);csvData=null;btn.disabled=true;}
+  };
+  reader.readAsText(file);
+}
+
+function showError(msg){const el=$('errorMsg');el.textContent=msg;el.style.display='block';}
+function hideError(){$('errorMsg').style.display='none';}
+
+btn.addEventListener('click',async()=>{
+  if(!csvData)return;
+  const walletName=$('walletName').value.trim()||'wallet';
+  btn.disabled=true;btn.textContent='Converting...';
+  try{await convert(csvData,walletName);}catch(e){showError(e.message);}
+  btn.disabled=false;btn.textContent='Convert & Download';
+});
+
+async function convert({headers,rows},walletName){
+  const cache=getCache();
+  const fiatCol=headers.find(h=>h.toLowerCase().includes('fiat'))||null;
+  
+  // Collect unique hashes
+  const hashes=[...new Set(rows.map(r=>(r.txhash||'').trim()).filter(Boolean))];
+  const toFetch=hashes.filter(h=>!cache[h]);
+  
+  // Show progress
+  const pw=$('progressWrap'),pf=$('progressFill'),pt=$('progressText');
+  let apiCalls=0;
+  if(toFetch.length){
+    pw.style.display='block';
+    for(let i=0;i<toFetch.length;i++){
+      await fetchTx(toFetch[i],cache);
+      apiCalls++;
+      const pct=((i+1)/toFetch.length*100).toFixed(0);
+      pf.style.width=pct+'%';
+      pt.textContent=`${i+1} / ${toFetch.length} transactions`;
+      if(i<toFetch.length-1)await new Promise(r=>setTimeout(r,200));// ~5 req/s
+    }
+    setCache(cache);
+  }
+  pw.style.display='none';
+
+  // Build known addresses from outgoing tx inputs
+  const knownAddresses=new Set();
+  for(const rec of rows){
+    if((rec.description||'').trim().toLowerCase()==='outgoing'){
+      const h=(rec.txhash||'').trim(),td=cache[h]||{};
+      for(const v of(td.vin||[]))knownAddresses.add(v.address);
+      const csvSats=Math.round(Math.abs(parseFloat(rec.amount||'0'))*1e8);
+      const vout=td.vout||[];
+      if(vout.length===2){
+        const diffs=vout.map(v=>({d:Math.abs(v.value-csvSats),a:v.address})).sort((a,b)=>a.d-b.d);
+        if(diffs.length===2)knownAddresses.add(diffs[1].a);
+      }
+    }
+  }
+
+  // Generate output
+  const out=[];const counter={};let minDate=null,maxDate=null;
+  for(const rec of rows){
+    const ts=(rec.time||'').trim();if(!ts)continue;
+    const dt=new Date(ts);if(isNaN(dt)){showError(`Bad date: ${ts}`);continue;}
+    if(!minDate||dt<minDate)minDate=dt;if(!maxDate||dt>maxDate)maxDate=dt;
+    const desc=(rec.description||'').trim().toLowerCase();
+    const txhash=(rec.txhash||'').trim();
+    const amount=Math.abs(parseFloat(rec.amount||'0'));
+    const asset=(rec.unit||'BTC').trim().toUpperCase();
+    const feeRaw=(rec['fee (BTC)']||'').trim();
+    const fee=feeRaw?Math.abs(parseFloat(feeRaw)):0;
+    const fiatRaw=fiatCol?(rec[fiatCol]||'').trim():'';
+    const fiatVal=fiatRaw?Math.abs(parseFloat(fiatRaw)):'';
+
+    const direction=desc==='incoming'?'receiver':'sender';
+    const txData=cache[txhash]||{vin:[],vout:[]};
+    const[,counterparty]=resolveAddresses(txData,desc,parseFloat(rec.amount||'0'),knownAddresses);
+
+    let funcName,methodId,activity;
+    if(desc==='incoming'){funcName='Deposit';methodId='deposit';activity='mining_payout';}
+    else if(desc==='redeposit'){funcName='Internal Transfer';methodId='internal_transfer';activity='internal_transfer';}
+    else{funcName='Withdrawal';methodId='withdrawal';activity='transfer_out';}
+
+    counter[txhash]=(counter[txhash]||0)+1;
+    const pad=n=>String(n).padStart(2,'0');
+    out.push([dt.getFullYear(),dt.getMonth()+1,dt.getDate(),`${pad(dt.getHours())}:${pad(dt.getMinutes())}:${pad(dt.getSeconds())}`,walletName,counterparty,'manual',direction,'token_transfer',asset,amount,fiatVal,'usd',txhash,counter[txhash],funcName,methodId,'',activity]);
+
+    if(fee>0){
+      counter[txhash]++;
+      let feeFiat='';
+      if(fiatVal&&amount>0)feeFiat=Math.round(fee*(fiatVal/amount)*100)/100;
+      out.push([dt.getFullYear(),dt.getMonth()+1,dt.getDate(),`${pad(dt.getHours())}:${pad(dt.getMinutes())}:${pad(dt.getSeconds())}`,walletName,counterparty,'manual','sender','gas',asset,fee,feeFiat,'usd',txhash,counter[txhash],'Transaction fee','fee','','network_fee']);
+    }
+  }
+
+  // Download
+  const csvOut=[HEADERS.join(','),...out.map(r=>r.map(v=>typeof v==='string'&&v.includes(',')?`"${v}"`:v).join(','))].join('\n');
+  const blob=new Blob([csvOut],{type:'text/csv'});
+  const now=new Date();const ts=`${now.getFullYear()}${pad2(now.getMonth()+1)}${pad2(now.getDate())}_${pad2(now.getHours())}${pad2(now.getMinutes())}${pad2(now.getSeconds())}`;
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=`${walletName}_${ts}.csv`;a.click();
+
+  // Stats
+  const mainRows=out.filter(r=>r[8]==='token_transfer').length;
+  const feeRows=out.filter(r=>r[8]==='gas').length;
+  const fmt=d=>d?`${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}`:'?';
+  $('sInputRows').textContent=rows.length;
+  $('sOutputRows').textContent=out.length;
+  $('sTransactions').textContent=mainRows;
+  $('sFeeRows').textContent=feeRows;
+  $('sDateRange').textContent=`${fmt(minDate)} → ${fmt(maxDate)}`;
+  $('sApiCalls').textContent=apiCalls;
+  $('statsCard').style.display='block';
+}
+function pad2(n){return String(n).padStart(2,'0');}
+</script>
+</body>
+</html>

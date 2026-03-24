@@ -33,6 +33,7 @@ select option:disabled{color:var(--dim)}
 .stat{background:var(--bg);border-radius:8px;padding:.75rem 1rem}
 .stat .val{font-size:1.2rem;font-weight:600}.stat .lbl{font-size:.7rem;color:var(--dim);text-transform:uppercase;margin-top:.15rem}
 .error{color:var(--red);font-size:.85rem;margin-top:.5rem;display:none}
+.log{margin-top:.5rem;font-size:.75rem;color:var(--dim);max-height:100px;overflow-y:auto;display:none;font-family:monospace;white-space:pre-wrap}
 footer{margin-top:2rem;color:var(--dim);font-size:.75rem}
 </style>
 </head>
@@ -55,6 +56,7 @@ footer{margin-top:2rem;color:var(--dim);font-size:.75rem}
       <div class="progress-text" id="progressText">0 / 0</div>
     </div>
     <div class="error" id="errorMsg"></div>
+    <div class="log" id="logMsg"></div>
   </div>
   <div style="text-align:center">
     <button class="btn btn-primary" id="convertBtn" disabled>Convert &amp; Download</button>
@@ -77,41 +79,69 @@ footer{margin-top:2rem;color:var(--dim);font-size:.75rem}
 const HEADERS=["Year","Month","Day","Time","Organizational Wallet","Participating Wallet","Network","Direction","Financial Action","Asset Identifier","Amount","Fiat Value (optional)","Fiat Currency","Transaction Hash","Transfer ID","Function Name","Method ID","Note","Activity Name"];
 const API_BASE="https://mempool.space/api/tx";
 
+const $=id=>document.getElementById(id);
+
+function log(msg){const el=$('logMsg');el.style.display='block';el.textContent+=msg+'\n';el.scrollTop=el.scrollHeight;}
+
 // Cache in localStorage
 function getCache(){try{return JSON.parse(localStorage.getItem('tres_tx_cache')||'{}');}catch(e){return {};}}
-function setCache(c){try{localStorage.setItem('tres_tx_cache',JSON.stringify(c));}catch(e){}}
+function setCache(c){try{localStorage.setItem('tres_tx_cache',JSON.stringify(c));}catch(e){console.warn('localStorage full',e);}}
 
 // Rate-limited fetch with retry
-async function fetchTx(hash,cache,signal){
+async function fetchTx(hash,cache){
   if(cache[hash])return cache[hash];
-  const resp=await fetch(`${API_BASE}/${hash}`,{headers:{'User-Agent':'tres-converter/1.0'},signal});
-  if(resp.status===429){await new Promise(r=>setTimeout(r,10000));return fetchTx(hash,cache,signal);}
-  if(!resp.ok){cache[hash]={vin:[],vout:[],error:resp.status};return cache[hash];}
-  const data=await resp.json();
-  const result={
-    vin:data.vin?.filter(v=>v.prevout?.scriptpubkey_address).map(v=>({address:v.prevout.scriptpubkey_address,value:v.prevout.value}))||[],
-    vout:data.vout?.filter(v=>v.scriptpubkey_address).map(v=>({address:v.scriptpubkey_address,value:v.value}))||[]
-  };
-  cache[hash]=result;
-  return result;
+  try{
+    const resp=await fetch(`${API_BASE}/${hash}`);
+    if(resp.status===429){log('Rate limited, waiting 10s...');await new Promise(r=>setTimeout(r,10000));return fetchTx(hash,cache);}
+    if(!resp.ok){cache[hash]={vin:[],vout:[],error:resp.status};return cache[hash];}
+    const data=await resp.json();
+    const result={
+      vin:(data.vin||[]).filter(v=>v.prevout&&v.prevout.scriptpubkey_address).map(v=>({address:v.prevout.scriptpubkey_address,value:v.prevout.value})),
+      vout:(data.vout||[]).filter(v=>v.scriptpubkey_address).map(v=>({address:v.scriptpubkey_address,value:v.value}))
+    };
+    cache[hash]=result;
+    return result;
+  }catch(e){
+    log('Fetch error for '+hash.slice(0,12)+'...: '+e.message);
+    cache[hash]={vin:[],vout:[],error:e.message};
+    return cache[hash];
+  }
 }
 
 function parseCSV(text){
   const lines=text.split(/\r?\n/).filter(l=>l.trim());
   if(lines.length<2)throw new Error('CSV has no data rows');
-  // Parse header
-  const hdr=lines[0].split(',').map(h=>h.trim().replace(/^"|"$/g,''));
+  // Handle quoted CSV properly
+  function parseLine(line){
+    const vals=[];
+    let cur='',inQ=false;
+    for(let i=0;i<line.length;i++){
+      const ch=line[i];
+      if(ch==='"'){
+        if(inQ&&i+1<line.length&&line[i+1]==='"'){cur+='"';i++;}
+        else{inQ=!inQ;}
+      }else if(ch===','&&!inQ){
+        vals.push(cur);cur='';
+      }else{
+        cur+=ch;
+      }
+    }
+    vals.push(cur);
+    return vals;
+  }
+  const hdr=parseLine(lines[0]).map(h=>h.trim());
   const rows=[];
   for(let i=1;i<lines.length;i++){
-    const vals=[];let cur='',inQ=false;
-    for(const ch of lines[i]){
-      if(ch==='"'){inQ=!inQ;}else if(ch===','&&!inQ){vals.push(cur.trim());cur='';}else{cur+=ch;}
-    }
-    vals.push(cur.trim());
-    if(vals.length>=hdr.length){const obj={};hdr.forEach((h,j)=>obj[h]=vals[j]||'');rows.push(obj);}
+    const vals=parseLine(lines[i]);
+    if(vals.length<3)continue;// skip truly empty lines
+    const obj={};
+    hdr.forEach((h,j)=>obj[h]=j<vals.length?vals[j].trim():'');
+    rows.push(obj);
   }
   return {headers:hdr,rows};
 }
+
+function pad2(n){return String(n).padStart(2,'0');}
 
 function resolveAddresses(txData,direction,csvAmountBtc,knownAddresses){
   const vin=txData.vin||[],vout=txData.vout||[];
@@ -139,25 +169,27 @@ function resolveAddresses(txData,direction,csvAmountBtc,knownAddresses){
 }
 
 // State
-let csvData=null,abortCtrl=null;
-const $=id=>document.getElementById(id);
+let csvData=null;
 const dz=$('dropzone'),fi=$('fileInput'),btn=$('convertBtn');
 
 dz.addEventListener('click',()=>fi.click());
 dz.addEventListener('dragover',e=>{e.preventDefault();dz.classList.add('dragover');});
 dz.addEventListener('dragleave',()=>dz.classList.remove('dragover'));
-dz.addEventListener('drop',e=>{e.preventDefault();dz.classList.remove('dragover');handleFile(e.dataTransfer.files[0]);});
+dz.addEventListener('drop',e=>{e.preventDefault();dz.classList.remove('dragover');if(e.dataTransfer.files[0])handleFile(e.dataTransfer.files[0]);});
 fi.addEventListener('change',()=>{if(fi.files[0])handleFile(fi.files[0]);});
 
 function handleFile(file){
-  if(!file||!file.name.endsWith('.csv')){showError('Please select a CSV file');return;}
+  if(!file||!file.name.toLowerCase().endsWith('.csv')){showError('Please select a CSV file');return;}
   const reader=new FileReader();
   reader.onload=e=>{
     try{
       csvData=parseCSV(e.target.result);
+      if(!csvData.rows.length)throw new Error('No data rows found in CSV');
       dz.classList.add('has-file');
-      dz.innerHTML=`<div class="icon">✅</div><div class="filename">${file.name}</div><p>${csvData.rows.length} rows loaded</p>`;
+      dz.innerHTML=`<div class="icon">✅</div><div class="filename">${file.name}</div><p>${csvData.rows.length} rows · ${csvData.headers.length} columns</p>`;
       btn.disabled=false;hideError();
+      log('Parsed '+csvData.rows.length+' rows');
+      log('Headers: '+csvData.headers.join(', '));
     }catch(err){showError(err.message);csvData=null;btn.disabled=true;}
   };
   reader.readAsText(file);
@@ -170,18 +202,27 @@ btn.addEventListener('click',async()=>{
   if(!csvData)return;
   const walletName=$('walletName').value.trim()||'wallet';
   btn.disabled=true;btn.textContent='Converting...';
-  try{await convert(csvData,walletName);}catch(e){showError(e.message);}
+  $('logMsg').textContent='';$('logMsg').style.display='none';
+  hideError();
+  try{
+    await convert(csvData,walletName);
+  }catch(e){
+    showError('Conversion failed: '+e.message);
+    log('ERROR: '+e.stack);
+  }
   btn.disabled=false;btn.textContent='Convert & Download';
 });
 
 async function convert({headers,rows},walletName){
   const cache=getCache();
   const fiatCol=headers.find(h=>h.toLowerCase().includes('fiat'))||null;
-  
+  log('Fiat column: '+(fiatCol||'none'));
+
   // Collect unique hashes
   const hashes=[...new Set(rows.map(r=>(r.txhash||'').trim()).filter(Boolean))];
   const toFetch=hashes.filter(h=>!cache[h]);
-  
+  log(hashes.length+' unique tx hashes, '+toFetch.length+' need API lookup');
+
   // Show progress
   const pw=$('progressWrap'),pf=$('progressFill'),pt=$('progressText');
   let apiCalls=0;
@@ -193,7 +234,7 @@ async function convert({headers,rows},walletName){
       const pct=((i+1)/toFetch.length*100).toFixed(0);
       pf.style.width=pct+'%';
       pt.textContent=`${i+1} / ${toFetch.length} transactions`;
-      if(i<toFetch.length-1)await new Promise(r=>setTimeout(r,200));// ~5 req/s
+      if(i<toFetch.length-1)await new Promise(r=>setTimeout(r,200));
     }
     setCache(cache);
   }
@@ -203,7 +244,8 @@ async function convert({headers,rows},walletName){
   const knownAddresses=new Set();
   for(const rec of rows){
     if((rec.description||'').trim().toLowerCase()==='outgoing'){
-      const h=(rec.txhash||'').trim(),td=cache[h]||{};
+      const h=(rec.txhash||'').trim();
+      const td=cache[h]||{};
       for(const v of(td.vin||[]))knownAddresses.add(v.address);
       const csvSats=Math.round(Math.abs(parseFloat(rec.amount||'0'))*1e8);
       const vout=td.vout||[];
@@ -213,13 +255,21 @@ async function convert({headers,rows},walletName){
       }
     }
   }
+  log(knownAddresses.size+' known wallet addresses');
 
-  // Generate output
-  const out=[];const counter={};let minDate=null,maxDate=null;
+  // Generate output rows
+  const out=[];
+  const counter={};
+  let minDate=null,maxDate=null,skipped=0;
+
   for(const rec of rows){
-    const ts=(rec.time||'').trim();if(!ts)continue;
-    const dt=new Date(ts);if(isNaN(dt)){showError(`Bad date: ${ts}`);continue;}
-    if(!minDate||dt<minDate)minDate=dt;if(!maxDate||dt>maxDate)maxDate=dt;
+    const ts=(rec.time||'').trim();
+    if(!ts){skipped++;continue;}
+    const dt=new Date(ts.includes('T')&&!ts.includes('Z')&&!ts.includes('+')?ts+'Z':ts);
+    if(isNaN(dt.getTime())){log('Bad date: '+ts);skipped++;continue;}
+    if(!minDate||dt<minDate)minDate=dt;
+    if(!maxDate||dt>maxDate)maxDate=dt;
+
     const desc=(rec.description||'').trim().toLowerCase();
     const txhash=(rec.txhash||'').trim();
     const amount=Math.abs(parseFloat(rec.amount||'0'));
@@ -239,36 +289,73 @@ async function convert({headers,rows},walletName){
     else{funcName='Withdrawal';methodId='withdrawal';activity='transfer_out';}
 
     counter[txhash]=(counter[txhash]||0)+1;
-    const pad=n=>String(n).padStart(2,'0');
-    out.push([dt.getFullYear(),dt.getMonth()+1,dt.getDate(),`${pad(dt.getHours())}:${pad(dt.getMinutes())}:${pad(dt.getSeconds())}`,walletName,counterparty,'manual',direction,'token_transfer',asset,amount,fiatVal,'usd',txhash,counter[txhash],funcName,methodId,'',activity]);
+
+    out.push([
+      dt.getUTCFullYear(),dt.getUTCMonth()+1,dt.getUTCDate(),
+      pad2(dt.getUTCHours())+':'+pad2(dt.getUTCMinutes())+':'+pad2(dt.getUTCSeconds()),
+      walletName,counterparty,'manual',direction,'token_transfer',asset,
+      amount,fiatVal==='0'?'':fiatVal,'usd',txhash,counter[txhash],
+      funcName,methodId,'',activity
+    ]);
 
     if(fee>0){
       counter[txhash]++;
       let feeFiat='';
       if(fiatVal&&amount>0)feeFiat=Math.round(fee*(fiatVal/amount)*100)/100;
-      out.push([dt.getFullYear(),dt.getMonth()+1,dt.getDate(),`${pad(dt.getHours())}:${pad(dt.getMinutes())}:${pad(dt.getSeconds())}`,walletName,counterparty,'manual','sender','gas',asset,fee,feeFiat,'usd',txhash,counter[txhash],'Transaction fee','fee','','network_fee']);
+      out.push([
+        dt.getUTCFullYear(),dt.getUTCMonth()+1,dt.getUTCDate(),
+        pad2(dt.getUTCHours())+':'+pad2(dt.getUTCMinutes())+':'+pad2(dt.getUTCSeconds()),
+        walletName,counterparty,'manual','sender','gas',asset,
+        fee,feeFiat,'usd',txhash,counter[txhash],
+        'Transaction fee','fee','','network_fee'
+      ]);
     }
   }
 
+  log('Generated '+out.length+' output rows ('+skipped+' skipped)');
+
+  if(!out.length){
+    showError('No rows generated. Check that your CSV has time, description, amount, txhash columns.');
+    return;
+  }
+
+  // Build CSV string - properly escape fields
+  function csvEscape(val){
+    const s=String(val===undefined||val===null?'':val);
+    if(s.includes(',')||s.includes('"')||s.includes('\n'))return '"'+s.replace(/"/g,'""')+'"';
+    return s;
+  }
+  const csvLines=[HEADERS.map(csvEscape).join(',')];
+  for(const row of out){
+    csvLines.push(row.map(csvEscape).join(','));
+  }
+  const csvOut=csvLines.join('\n');
+
   // Download
-  const csvOut=[HEADERS.join(','),...out.map(r=>r.map(v=>typeof v==='string'&&v.includes(',')?`"${v}"`:v).join(','))].join('\n');
-  const blob=new Blob([csvOut],{type:'text/csv'});
-  const now=new Date();const ts=`${now.getFullYear()}${pad2(now.getMonth()+1)}${pad2(now.getDate())}_${pad2(now.getHours())}${pad2(now.getMinutes())}${pad2(now.getSeconds())}`;
-  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=`${walletName}_${ts}.csv`;a.click();
+  const blob=new Blob([csvOut],{type:'text/csv;charset=utf-8'});
+  const now=new Date();
+  const ts=now.getFullYear()+pad2(now.getMonth()+1)+pad2(now.getDate())+'_'+pad2(now.getHours())+pad2(now.getMinutes())+pad2(now.getSeconds());
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  a.download=walletName+'_'+ts+'.csv';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(a.href);
 
   // Stats
   const mainRows=out.filter(r=>r[8]==='token_transfer').length;
   const feeRows=out.filter(r=>r[8]==='gas').length;
-  const fmt=d=>d?`${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}`:'?';
+  const fmt=d=>d?d.getUTCFullYear()+'-'+pad2(d.getUTCMonth()+1)+'-'+pad2(d.getUTCDate()):'?';
   $('sInputRows').textContent=rows.length;
   $('sOutputRows').textContent=out.length;
   $('sTransactions').textContent=mainRows;
   $('sFeeRows').textContent=feeRows;
-  $('sDateRange').textContent=`${fmt(minDate)} → ${fmt(maxDate)}`;
+  $('sDateRange').textContent=fmt(minDate)+' → '+fmt(maxDate);
   $('sApiCalls').textContent=apiCalls;
   $('statsCard').style.display='block';
+  log('Done! Downloaded '+walletName+'_'+ts+'.csv');
 }
-function pad2(n){return String(n).padStart(2,'0');}
 </script>
 </body>
 </html>

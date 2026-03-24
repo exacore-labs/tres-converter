@@ -248,28 +248,55 @@ async function convert({headers,rows},walletName){
   }
   pw.style.display='none';
 
-  // Fetch historical BTC/USD prices from CryptoCompare (one bulk call)
-  const txDates=new Set(rows.map(r=>(r.time||'').trim().slice(0,10)).filter(Boolean));
+  // Fetch minute-level BTC/USD prices from Binance US
   let priceCache={};
-  try{priceCache=JSON.parse(localStorage.getItem('tres_price_cache')||'{}');}catch(e){}
-  const missingDates=[...txDates].filter(d=>!priceCache[d]);
-  if(missingDates.length){
-    log('Fetching historical BTC/USD prices...');
-    try{
-      const resp=await fetch('https://min-api.cryptocompare.com/data/v2/histoday?fsym=BTC&tsym=USD&limit=2000');
-      const d=await resp.json();
-      for(const p of(d.Data?.Data||[])){
-        const dt=new Date(p.time*1000);
-        const ds=dt.getUTCFullYear()+'-'+pad2(dt.getUTCMonth()+1)+'-'+pad2(dt.getUTCDate());
-        priceCache[ds]=p.close;
-      }
-      try{localStorage.setItem('tres_price_cache',JSON.stringify(priceCache));}catch(e){}
-      const still=[...txDates].filter(d=>!priceCache[d]);
-      log(Object.keys(priceCache).length+' daily prices cached, '+still.length+' missing');
-    }catch(e){log('Price fetch failed: '+e.message+' (using export values as fallback)');}
-  }else{
-    log('Price cache hit for all '+txDates.size+' dates');
+  try{priceCache=JSON.parse(localStorage.getItem('tres_price_cache_min')||'{}');}catch(e){}
+
+  // Collect unique minute-timestamps
+  const minuteKeys=new Map();// minuteKey -> ts_ms
+  for(const rec of rows){
+    const ts=(rec.time||'').trim();if(!ts)continue;
+    const dt=new Date(ts.includes('T')&&!ts.includes('Z')&&!ts.includes('+')?ts+'Z':ts);
+    if(isNaN(dt.getTime()))continue;
+    const minuteTs=Math.floor(dt.getTime()/60000)*60;
+    const key=String(minuteTs);
+    if(!priceCache[key]&&!minuteKeys.has(key))minuteKeys.set(key,minuteTs*1000);
   }
+
+  const pricesToFetch=[...minuteKeys.entries()];
+  if(pricesToFetch.length){
+    log('Fetching '+pricesToFetch.length+' minute-level BTC/USD prices from Binance...');
+    pw.style.display='block';
+    pf.style.width='0%';
+    let priceErrors=0;
+    for(let i=0;i<pricesToFetch.length;i++){
+      const[key,tsMs]=pricesToFetch[i];
+      try{
+        const resp=await fetch(`https://api.binance.us/api/v3/klines?symbol=BTCUSDT&interval=1m&startTime=${tsMs}&limit=1`);
+        if(resp.status===429){
+          log('Rate limited, waiting 60s...');
+          await new Promise(r=>setTimeout(r,60000));
+          i--;continue;// retry
+        }
+        if(resp.ok){
+          const d=await resp.json();
+          if(d&&d[0])priceCache[key]=parseFloat(d[0][4]);
+        }else{priceErrors++;}
+      }catch(e){priceErrors++;}
+      // Rate limit: 10 req/s
+      if(i<pricesToFetch.length-1)await new Promise(r=>setTimeout(r,100));
+      if((i+1)%50===0||i===pricesToFetch.length-1){
+        const pct=((i+1)/pricesToFetch.length*100).toFixed(0);
+        pf.style.width=pct+'%';
+        pt.textContent=`${i+1} / ${pricesToFetch.length} prices`;
+      }
+    }
+    try{localStorage.setItem('tres_price_cache_min',JSON.stringify(priceCache));}catch(e){}
+    log(Object.keys(priceCache).length+' minute prices cached'+(priceErrors?' ('+priceErrors+' errors)':''));
+  }else{
+    log('Price cache hit for all minutes');
+  }
+  pw.style.display='none';
 
   // Build known addresses from outgoing tx inputs
   const knownAddresses=new Set();
@@ -307,11 +334,11 @@ async function convert({headers,rows},walletName){
     const asset=(rec.unit||'BTC').trim().toUpperCase();
     const feeRaw=(rec['fee (BTC)']||'').trim();
     const fee=feeRaw?Math.abs(parseFloat(feeRaw)):0;
-    // Use historical price for fiat value (fall back to export value)
-    const txDate=ts.slice(0,10);
-    let fiatVal='',btcPrice=0;
-    if(priceCache[txDate]){
-      btcPrice=priceCache[txDate];
+    // Use minute-level price for fiat value (fall back to export value)
+    const dtPrice=new Date(ts.includes('T')&&!ts.includes('Z')&&!ts.includes('+')?ts+'Z':ts);
+    const minuteKey=String(Math.floor(dtPrice.getTime()/60000)*60);
+    let fiatVal='',btcPrice=priceCache[minuteKey]||0;
+    if(btcPrice>0){
       fiatVal=Math.round(amount*btcPrice*100)/100;
     }else{
       const fiatRaw=fiatCol?(rec[fiatCol]||'').trim():'';

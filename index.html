@@ -79,6 +79,14 @@ footer{margin-top:2rem;color:var(--dim);font-size:.75rem}
 const HEADERS=["Year","Month","Day","Time","Organizational Wallet","Participating Wallet","Network","Direction","Financial Action","Asset Identifier","Amount","Fiat Value (optional)","Fiat Currency","Transaction Hash","Transfer ID","Function Name","Method ID","Note","Activity Name"];
 const API_BASE="https://mempool.space/api/tx";
 
+// Known mining pool payout addresses (Luxor)
+const POOL_ADDRESSES=new Set([
+  "bc1ql4p0pcgvkjrld68uuvmj87vgactu0chm8zgx69",
+  "1CK6KHY6MHgYvmRQ4PAafKYDrg1ejbH1cE",
+  "bc1qtzqyvfqqm4vc2xfcdjedt7d5k6t8h3vqhw2mpk",
+  "bc1qrgcrfhxemldx3xafn052da2rjcdlhka6k09su7",
+]);
+
 const $=id=>document.getElementById(id);
 
 function log(msg){const el=$('logMsg');el.style.display='block';el.textContent+=msg+'\n';el.scrollTop=el.scrollHeight;}
@@ -284,7 +292,12 @@ async function convert({headers,rows},walletName){
     const[,counterparty]=resolveAddresses(txData,desc,parseFloat(rec.amount||'0'),knownAddresses);
 
     let funcName,methodId,activity;
-    if(desc==='incoming'){funcName='Deposit';methodId='deposit';activity='mining_payout';}
+    if(desc==='incoming'){
+      const sender=(txData.vin&&txData.vin[0])?txData.vin[0].address:'';
+      const isPool=POOL_ADDRESSES.has(sender);
+      if(isPool){funcName='Mining Payout';methodId='mining_payout';activity='mining_payout';}
+      else{funcName='Deposit';methodId='deposit';activity='deposit';}
+    }
     else if(desc==='redeposit'){funcName='Internal Transfer';methodId='internal_transfer';activity='internal_transfer';}
     else{funcName='Withdrawal';methodId='withdrawal';activity='transfer_out';}
 
